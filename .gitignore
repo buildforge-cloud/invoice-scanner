@@ -3,3 +3,6 @@ dist/
 .env
 .env.local
 .claude/
+# compiled JS artefacts alongside TS source
+src/*.js
+src/**/*.js

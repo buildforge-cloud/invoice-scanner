@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { ExtractionResult } from "../types/invoice";
+import { getBackend, DEFAULT_BACKEND_ID } from "../backends/registry";
 
 export type ModelStatus = "idle" | "loading" | "ready" | "error";
 
@@ -13,7 +14,7 @@ interface InvoiceWorker {
 type InferResolve = (r: ExtractionResult) => void;
 type InferReject = (e: Error) => void;
 
-export function useInvoiceWorker(): InvoiceWorker {
+export function useInvoiceWorker(backendId: string = DEFAULT_BACKEND_ID): InvoiceWorker {
   const workerRef = useRef<Worker | null>(null);
   const resolveRef = useRef<InferResolve | null>(null);
   const rejectRef = useRef<InferReject | null>(null);
@@ -23,10 +24,24 @@ export function useInvoiceWorker(): InvoiceWorker {
   const [statusMessage, setStatusMessage] = useState("");
 
   useEffect(() => {
-    const worker = new Worker(
-      new URL("../workers/inference.worker.ts", import.meta.url),
-      { type: "module" }
-    );
+    // Terminate previous worker before starting a new backend.
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+      // Reject any pending inference from the old backend.
+      if (rejectRef.current) {
+        rejectRef.current(new Error("Backend switched"));
+        resolveRef.current = null;
+        rejectRef.current = null;
+      }
+    }
+
+    setModelStatus("loading");
+    setProgress(0);
+    setStatusMessage("Initializing…");
+
+    const entry = getBackend(backendId);
+    const worker = entry.createWorker();
 
     worker.onmessage = (e: MessageEvent) => {
       const msg = e.data as {
@@ -76,16 +91,13 @@ export function useInvoiceWorker(): InvoiceWorker {
     };
 
     workerRef.current = worker;
-
-    setModelStatus("loading");
-    setStatusMessage("Initializing…");
     worker.postMessage({ type: "load" });
 
     return () => {
       worker.terminate();
       workerRef.current = null;
     };
-  }, []);
+  }, [backendId]);
 
   const infer = useCallback((imageUrl: string): Promise<ExtractionResult> => {
     return new Promise<ExtractionResult>((resolve, reject) => {

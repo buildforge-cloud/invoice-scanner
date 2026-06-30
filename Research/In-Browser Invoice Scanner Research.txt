@@ -1,0 +1,281 @@
+﻿Edge-Based Document AI: Architectural Strategies for In-Browser Structured Invoice Extraction
+The rapid advancement of web-runtime acceleration has unlocked the feasibility of executing complex deep learning tasks entirely client-side, running locally within the end-user’s browser via WebAssembly (WASM) or WebGPU through the ONNX Runtime1. In-browser processing guarantees absolute data privacy, eliminates per-token API billing, and allows for offline functionality1. However, parsing unstructured, arbitrary invoice documents to consistently extract high-fidelity fields—such as invoice numbers, transaction dates, vendor/buyer entities, line items, and financial totals—presents an engineering challenge on edge devices.
+General vision-language models like SmolVLM-500M-Instruct often fail on structured document tasks because they lack layout-aware inductive biases, resulting in coordinate drifting, key-value mismatching, and numerical hallucinations2. This report evaluates document-specialized architectures, compares single-stage vision-language models with decoupled two-stage pipelines, and analyzes cloistered runtime execution strategies under strict browser constraints1.
+Document-Specialized Model Evaluations in the ONNX Ecosystem
+To establish a baseline of viable architectures, ten candidates specializing in document understanding or vision-language processing were evaluated. This evaluation focused on their conversion status to the Open Neural Network Exchange (ONNX) format, native compatibility with Transformers.js, execution footprints under quantization, and practical applicability to invoice extraction tasks1.
+
+
+Model Candidate
+	ONNX Availability
+	Transformers.js Supported
+	Quantized Runtime Footprint
+	Visual & Structural Suitability
+	Florence-2 (base)
+	Fully Available5
+	Yes (Native support in v3/v4)6
+	~250 MB (Mixed quantization: fp16/q4)6
+	Excellent: Unified multi-task framework natively mapping coordinates, bounding boxes, and OCR text8.
+	Donut (base-docvqa)
+	Fully Available11
+	Yes (Mapped to QA tasks)12
+	~187 MB (bnb4 encoder + q8 decoder)12
+	Moderate: Tailored for document structures but prone to numerical hallucinations and decoder timeouts2.
+	LayoutLMv3 (base)
+	Available (Encoder only)
+	Partially (Token classification only)
+	~125 MB (8-bit quantization)
+	Low: Requires external OCR coordinates to construct layout embeddings; cannot perform generative end-to-end parsing.
+	TrOCR (base)
+	Fully Available16
+	Yes (Image-to-text pipeline)16
+	~300 MB (Unquantized; q4 options exist)16
+	Low: Restricted to single-line or isolated text block transcription; lacks page-level spatial layout understanding15.
+	GOT-OCR 2.0
+	Available (Community ports)18
+	No (Requires custom decoder runtime)
+	~380 MB (4-bit quantization)20
+	Moderate: Strong formatting and formatting alignment but highly compute-intensive, requiring dedicated GPU runtimes2.
+	Nougat (base)
+	Experimental Exports15
+	No (Prone to compiler timeouts)15
+	~350 MB (8-bit quantization)
+	Low: Specialized in scientific document-to-LaTeX rendering; poorly suited for arbitrary key-value database mapping15.
+	Surya
+	Layout/Detection Only
+	No (Orchestrated externally)22
+	~150 MB (Detection weights)
+	Low: Operates as a layout analyzer and line detector, not a generative text extractor22.
+	moondream2
+	Fully Available24
+	Yes (Supported via pipeline)24
+	~450 MB (4-bit text decoder)24
+	Low: General vision-language model; lacks layout awareness, leading to low parsing accuracy on dense tables26.
+	Phi-3.5-vision
+	Fully Available28
+	Yes (Direct pipeline execution)
+	~2.2 GB (4-bit quantization)
+	Low: Model size exceeds browser download, caching, and execution limits on standard client devices.
+	Qwen2-VL (2B)
+	Fully Available29
+	Yes (v4.1/v4.2 implementation)30
+	~1.3 GB (q4 text + fp16 vision)32
+	Low: Substantial visual token sizes require several gigabytes of external weights, causing high latency32.
+	Candidate Trade-Off Analysis
+Among these options, Florence-2 and Donut are the only generative models that fit within a 500 MB browser budget while maintaining native compatibility with Transformers.js3.
+LayoutLMv3 is an encoder-only architecture. This means it cannot generate text directly. Instead, it classifies tokens that have already been extracted and mapped by an external OCR engine. This limitation makes it less flexible for zero-shot extraction on varied invoice layouts.
+TrOCR is highly accurate for transcribing single lines of printed or handwritten text15, but it lacks the structural awareness needed to parse multi-column document layouts15.
+Models like Qwen2-VL-2B and Phi-3.5-vision offer strong accuracy but are too large for standard web runtimes28. Their model files (often exceeding 1.5 GB even with quantization) lead to high network latency, large memory usage, and frequent browser tab crashes32.
+Browser-Deployable OCR and Extraction Pipelines: Architectural Trade-Offs
+When designing an in-browser extraction engine, developers must choose between a Single-Stage Multimodal Model (VLM) or a Decoupled Two-Stage Pipeline.
+
+
+
+
+
+
+Single-Stage Multimodal Pipeline:
++---------------+     ONNX Runtime Web (WebGPU)      +-----------------------------+     Structured
+| Invoice Image | ---------------------------------> | Florence-2 / Donut          | --> JSON Fields
++---------------+                                    | (Joint OCR & Layout Parsing)|     (Schema-Guided)
+                                                    +-----------------------------+
+
+Decoupled Two-Stage Pipeline:
++---------------+     WASM / WebGPU (CPU Fallback)   +-----------------------------+     Extracted
+| Invoice Image | ---------------------------------> | Stage 1: ppu-paddle-ocr     | --> Bounding Boxes
++---------------+                                    | (Deterministic Text Extraction)|   & Text Lines
+                                                    +-----------------------------+
+                                                                   |
+                                                                   v
++---------------+     ONNX Runtime Web (WebGPU)      +-----------------------------+     Structured
+| JSON Schema   | ---------------------------------> | Stage 2: Qwen2.5-0.5B-it    | --> JSON Fields
+| Constraint    |                                    | (Semantic Layout Parser)    |     (Schema-Guided)
++---------------+                                    +-----------------------------+
+
+The Decoupled Two-Stage Pipeline
+The decoupled pipeline separates the extraction process into two distinct stages:
+1. First Stage (Text Extraction): A small, specialized optical character recognition (OCR) engine extracts text characters and their exact bounding box coordinates from the image34.
+2. Second Stage (Information Extraction): A text-only Small Language Model (SLM) processes the extracted text, using the layout coordinates to parse and organize the data into the target fields6.
+This approach can be implemented using either Tesseract.js or PaddleOCR for the first-stage text extraction:
+* Tesseract.js: A port of the classic Tesseract engine36. It relies on an older LSTM architecture and requires downloading language-specific files (such as nor for Norwegian)37. Tesseract.js is prone to errors on dense, multi-column invoice tables, often misaligning columns or misreading low-resolution text37.
+* PaddleOCR (via ppu-paddle-ocr): A modern, highly optimized OCR engine34. It runs PP-OCRv5/v6 models natively in the browser using ONNX Runtime Web37. The combined text detection and recognition models are small (under 15 MB) and run quickly on consumer CPUs or WebAssembly runtimes37. This engine delivers high accuracy (achieving up to 99.22% on receipt benchmarks) and handles complex multi-column structures and tabular layouts with minimal errors37.
+Once the text and layout coordinates are extracted, they are formatted into a structured text payload and passed to a small, text-only model like Qwen2.5-0.5B-Instruct or SmolLM2-135M-Instruct6. These text-only models are small (under 350 MB in 4-bit quantization) and highly optimized for WebGPU execution6.
+Comparing Single-Stage and Two-Stage Pipelines
+The table below compares the performance of single-stage vision-language models against decoupled two-stage pipelines.
+
+
+Metric
+	Single-Stage VLM (e.g., Florence-2-base)
+	Decoupled Two-Stage Pipeline (PaddleOCR + Qwen2.5-0.5B)
+	Inference Speed
+	Slow to Moderate: Requires running the heavy vision encoder once41, followed by slower autoregressive text generation over a large visual key-value (KV) cache31.
+	Fast: The OCR stage runs in under 150ms37, and the text-only model generates tokens quickly because it does not need to process visual attention matrices6.
+	Transcription Accuracy
+	Moderate: Prone to visual hallucinations, character omissions, or misinterpreting numbers on dense financial tables2.
+	High: The OCR stage uses deterministic character recognition37. The language model only organizes the parsed text, preventing numerical hallucinations2.
+	Layout Awareness
+	Implicit: Relies entirely on the model's visual attention mechanisms to associate keys with values2.
+	Explicit: Bounding box coordinates from the OCR stage are passed directly to the model, preserving spatial layout and column structures35.
+	Download Footprint
+	Compact: Single-model download, typically between 300 MB and 400 MB under mixed-precision quantization6.
+	Flexible: Combined model size is ~365 MB (OCR is ~15 MB37; the 4-bit text-only model is ~350 MB6).
+	Multilingual Handling
+	Limited: Requires fine-tuning on regional documents to accurately parse non-English layout structures43.
+	Excellent: Multilingual OCR engines natively support over 50 languages (including Norwegian)35.
+	Edge Bottlenecks: Vision Encoding vs. Autoregressive Decoding
+Analyzing edge execution paths reveals an asymmetrical performance bottleneck. In single-stage VLMs, the vision encoder processes high-resolution image matrices to generate visual hidden states41. While this visual pass is computationally heavy, it runs only once per image41.
+The primary latency bottleneck is the text decoder41. The decoder must run autoregressively, performing a full forward pass to generate each individual token41. On edge hardware using WebAssembly or low-power WebGPU configurations, this continuous text generation can slow down performance15.
+Because VLMs represent images using hundreds of visual tokens, the decoder must maintain a large key-value (KV) cache31. This increases memory usage and slows down execution on resource-constrained devices15.
+Detailed Evaluation of the Donut Architecture
+The Document Understanding Transformer (Donut) was developed by NAVER Clova as an OCR-free system for document parsing42. It processes document images directly using an end-to-end transformer architecture, reading visual features and generating structured text without an intermediate OCR step2.
+ONNX Availability and Size Under Quantization
+Donut models are available in the ONNX format and can be loaded in the browser using Transformers.js11. For example, the Xenova/donut-base-finetuned-docvqa checkpoint is natively supported under the document-question-answering task pipeline3.
+The model's file sizes vary depending on the quantization level applied to its two main components:
+1. Visual Encoder (Swin Transformer): The FP32 version is ~150 MB. When converted to 4-bit quantization (such as the bnb4 format), its footprint drops to 57.1 MB14.
+2. Autoregressive Decoder (BART): The unquantized FP32 model is 505.1 MB11. Applying an 8-bit quantization (q8) reduces this component to 130 MB, bringing the combined model size to around 187 MB12.
+While these sizes fit within browser storage budgets, compiling Donut's large sequence-to-sequence decoder in WebAssembly or WebGPU can cause issues15. The complex ONNX graphs often trigger compilation timeouts or out-of-memory errors on devices with limited RAM15.
+Structural Reliability on European and Multilingual Invoices
+Although Donut works well on standard, pre-trained datasets like DocVQA or SROIE13, its OCR-free architecture has limitations when processing unseen European invoices.
+Donut relies on its decoder's vocabulary to transcribe text directly from visual features2. Without a deterministic OCR step to extract raw characters, the model must read and parse layout structures simultaneously2. When processing unfamiliar layouts or non-English documents, this can lead to several errors:
+* Transcription Hallucinations: Because Donut does not use a direct character recognition step, it can misread critical financial figures (such as total amounts or invoice numbers) if the visual quality is low or the layout is complex2.
+* Diacritic Sensitivity: European languages, such as Norwegian, use unique diacritical marks (e.g., æ, ø, å)49. Because Donut is trained primarily on English-centric document datasets, its visual encoder often struggles to resolve these characters, leading to spelling errors in vendor names and addresses.
+* Layout Drift: If an invoice format differs from the structures in the training data, Donut can lose track of document hierarchy. This causes it to miss key-value associations or fail to output the correct target schema tags2.
+Managing Practical Browser Constraints and Runtime Acceleration
+Deploying neural network pipelines directly in the browser requires managing strict resource limitations1. To ensure a responsive user experience, the system must balance model download sizes with runtime execution speed1.
+Optimizing Engine Configurations: WebGPU and WebAssembly
+To achieve acceptable performance on client devices, developers should prioritize the WebGPU execution provider (device: "webgpu") over WebAssembly (WASM)1. WebGPU provides direct access to GPU hardware acceleration, delivering up to 100x faster execution than CPU-bound WASM runtimes1.
+However, because some model layers are highly sensitive to quantization, a mixed-precision execution strategy is recommended:
+
+
+
+
+
+
+JavaScript
+// Mixed-precision modular instantiation configuration for Florence-2 in Transformers.js
+const model = await Florence2ForConditionalGeneration.from_pretrained("onnx-community/Florence-2-base-ft", {
+ dtype: {
+   embed_tokens: "fp16",       // Preserves coordinate precision for layout mapping
+   vision_encoder: "fp16",     // Preserves detail in visual embeddings to avoid character loss
+   encoder_model: "q4",        // Compresses the text encoder to save memory
+   decoder_model_merged: "q4"  // Compresses the autoregressive decoder to speed up generation
+ },
+ device: "webgpu"              // Enables high-speed WebGPU acceleration
+});
+
+Using this mixed-precision configuration with onnx-community/Florence-2-base-ft balances memory usage and performance6:
+* Embedding and Vision Towers: Keeping these components in fp16 prevents visual detail loss6.
+* Autoregressive Decoders: Quantizing these layers to 4-bit (q4 or q4f16) reduces model size and speeds up token generation6.
+Managing Model Sizes and Download Budgets
+To keep initial download times reasonable, the entire model footprint should fit within a 500 MB browser budget3.
+When using Florence-2, the combined size of the mixed-precision files is highly optimized7:
+* vision_encoder_fp16.onnx is 367 MB7.
+* embed_tokens_fp16.onnx is 78.8 MB7.
+* encoder_model_q4.onnx is 30.1 MB7.
+* decoder_model_merged_q4.onnx is 64.4 MB7.
+This configuration requires a total download of ~540 MB7. While slightly over the preferred target, the browser natively caches these files in IndexedDB on the first run, making subsequent loads instantaneous1.
+Alternatively, if a smaller footprint is required, the vision encoder can be quantized to 4-bit (bnb4), reducing its size to 76 MB and bringing the total download budget down to ~249 MB7. This lower footprint makes the application much more accessible on slow network connections3.
+Ensuring Structured JSON Schema Outputs
+A common issue when running text generation models on the edge is output consistency. In-browser models can easily output malformed JSON, break schemas, or generate endless repetitive loops46.
+To solve this, developers can integrate llguidance (transformers-llguidance) directly into the pipeline54. This library compiles a target JSON schema into a finite state machine (FSM) at runtime55.
+During token generation, the FSM acts as a logit processor, masking out tokens that would violate the schema55. This forces the model to generate syntactically valid JSON that perfectly matches the required fields55.
+Production Recommendation and Implementation Strategy
+For a client-side invoice scanner running entirely in-browser under a 500 MB memory budget, the decoupled two-stage pipeline is the most reliable and performant architecture.
+
+
+
+
+
+
+Two-Stage Production Architecture:
++-------------------+
+| Scanned Invoice   |
+| (Norwegian/Euro)  |
++-------------------+
+         |
+         v
++-----------------------------------------------------------+
+| Stage 1: ppu-paddle-ocr (PP-OCRv6 WebAssembly/ONNX)      |
+| - Fast, deterministic character transcription (<200ms)    |
+| - Native support for Norwegian characters (æ, ø, å)        |
++-----------------------------------------------------------+
+         |
+         | Bounding Boxes + Text Coordinates
+         v
++-----------------------------------------------------------+
+| Stage 2: Qwen2.5-0.5B-Instruct (4-bit WebGPU)             |
+| - Loaded via Transformers.js with transformers-llguidance |
+| - Logit masking forces valid JSON Schema output           |
+| - Only performs semantic parsing (no OCR hallucinations)  |
++-----------------------------------------------------------+
+         |
+         v
++-------------------+
+| Valid Structured  |
+| JSON Output       |
++-------------------+
+
+Why the Decoupled Pipeline Succeeds on the Edge
+1. Guaranteed Data Integrity: Financial applications require precise character transcription2. Separating text detection from semantic parsing ensures that the language model cannot hallucinate or invent numbers2. The system only extracts text blocks directly identified by the OCR stage2.
+2. Robust Multilingual Handling: European invoices, particularly from Nordic regions, include special characters like æ, ø, and å49. While visual document models often misidentify these letters, multilingual OCR engines (such as PP-OCRv6) support them natively35, ensuring accurate vendor names and addresses.
+3. Low Latency on Edge Hardware: Processing images through a visual transformer's cross-attention layers on the edge is computationally expensive and slow2. By decoupling the stages, the lightweight OCR model runs in milliseconds37. The text-only language model then processes a small, clean token payload, resulting in a fast, responsive user interface.
+Recommended Implementation Details
+For developers building this pipeline, the following configuration balances accuracy, speed, and size:
+* First Stage (OCR): Use ppu-paddle-ocr to run optimized PP-OCRv6 graphs via ONNX Runtime Web37. This stage detects characters and outputs their coordinates35.
+* Second Stage (Semantic Parsing): Use Qwen2.5-0.5B-Instruct quantized to 4-bit (q4) via Transformers.js6. Use the transformers-llguidance library to enforce the target JSON schema, ensuring consistent and valid outputs54.
+Referanser
+1. Transformers.js: Run AI Models Directly in the Browser - Developers Digest, https://www.developersdigest.tech/blog/transformers-js-guide
+2. 8 Top Open-Source OCR Models Compared: A Complete Guide - Modal, https://modal.com/blog/8-top-open-source-ocr-models-compared
+3. WebExtensions AI API — Firefox Source Docs documentation - Mozilla, https://firefox-source-docs.mozilla.org/toolkit/components/ml/extensions.html
+4. https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1/README.md
+5. onnx-community/Florence-2-base-ft - Hugging Face, https://huggingface.co/onnx-community/Florence-2-base-ft
+6. Using quantized models (dtypes) - Hugging Face, https://huggingface.co/docs/transformers.js/guides/dtypes
+7. onnx-community/Florence-2-base-ft at main - Hugging Face, https://huggingface.co/onnx-community/Florence-2-base-ft/tree/main/onnx
+8. Florence-2: Open Source Vision Foundation Model - OpenVINO™ documentation, https://docs.openvino.ai/2024/notebooks/florence2-with-output.html
+9. Florence VLM: The Lightweight Zero-Shot Object Detection Model Ready for Production, https://medium.com/@priyadarshinichavan/florence-vlm-the-lightweight-zero-shot-object-detection-model-ready-for-production-b0938b02b050
+10. Is anything better than gemma-3-27b for handwritten text recognition? - Reddit, https://www.reddit.com/r/LocalLLaMA/comments/1mlg0sk/is_anything_better_than_gemma327b_for_handwritten/
+11. Xenova/donut-base-finetuned-docvqa at d9f97a2fb22deb50fe6352f411703cff81cc4f1e, https://huggingface.co/Xenova/donut-base-finetuned-docvqa/blame/d9f97a2fb22deb50fe6352f411703cff81cc4f1e/onnx/decoder_model.onnx
+12. EngineProcess.sys.mjs - mozsearch - Searchfox, https://searchfox.org/firefox-main/source/toolkit/components/ml/content/EngineProcess.sys.mjs
+13. Transformers.js: (v2) testing 20 AI models in single HTML | by Sathit Jittanupat - Medium, https://jsat66.medium.com/transformers-js-testing-20-ai-models-in-single-html-8ec0233557ba
+14. Xenova/donut-base-finetuned-docvqa at main - Hugging Face, https://huggingface.co/Xenova/donut-base-finetuned-docvqa/blame/main/onnx/encoder_model_bnb4.onnx
+15. vision-encoder-decoder / image-to-text + document-question-answering: all models pass wmk perf · Issue #133 · microsoft/winml-cli - GitHub, https://github.com/microsoft/winml-cli/issues/133
+16. onnx-community/trocr-base-stage1-ONNX - Hugging Face, https://huggingface.co/onnx-community/trocr-base-stage1-ONNX
+17. model score trOcr - Kaggle, https://www.kaggle.com/code/ahmadaneeq/model-score-trocr
+18. GitHub - BaofengZan/GOT-OCRv2-onnx: 用于学习GOT/Qwen/OnnxLLm, https://github.com/BaofengZan/GOT-OCRv2-onnx
+19. Models - Hugging Face, https://huggingface.co/models?other=ocr2.0
+20. Texo: Formula Recognition within 20M Parameters We thank Mathieu Fontaine and Anthony Larcher for reviewing our paper and we thank Telecom Paris for providing GPU resources. - arXiv, https://arxiv.org/html/2602.17189v1
+21. onnx-community/nougat-latex-base-ONNX - Hugging Face, https://huggingface.co/onnx-community/nougat-latex-base-ONNX
+22. edujbarrios/awesome-vision-ai-stack: A curated, builder ... - GitHub, https://github.com/edujbarrios/awesome-vision-ai-stack
+23. CrispStrobe/CrispSorter: AI-powered document organiser ... - GitHub, https://github.com/CrispStrobe/CrispSorter
+24. onnx-community/moondream2.text_model-ONNX - Hugging Face, https://huggingface.co/onnx-community/moondream2.text_model-ONNX
+25. hfblog/transformersjs-v3.md at main · AnswerDotAI/hfblog · GitHub, https://github.com/AnswerDotAI/hfblog/blob/main/transformersjs-v3.md
+26. LocalAI models, https://localai.io/gallery.html
+27. Add support for Florence 2? · Issue #815 · huggingface/transformers.js - GitHub, https://github.com/huggingface/transformers.js/issues/815
+28. ONNX Model Explorer - a Hugging Face Space by onnx-community, https://huggingface.co/spaces/onnx-community/model-explorer
+29. Qwen2-VL-2B-Instruct | PromptLayer Models, https://www.promptlayer.com/models/qwen2-vl-2b-instruct/
+30. onnx-community/Qwen2-VL-2B-Instruct - Hugging Face, https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct
+31. Releases · huggingface/transformers.js - GitHub, https://github.com/xenova/transformers.js/releases
+32. onnx-community/Qwen2-VL-2B-Instruct at refs/pr/3 - Hugging Face, https://huggingface.co/onnx-community/Qwen2-VL-2B-Instruct/tree/refs%2Fpr%2F3/onnx
+33. Local RAG - Awesome MCP Servers, https://mcpservers.org/servers/shinpr/mcp-local-rag
+34. @siva-sub/client-ocr-app - npm, https://www.npmjs.com/package/@siva-sub/client-ocr-app?activeTab=readme
+35. GitHub - PaddlePaddle/PaddleOCR: Turn any PDF or image document into structured data for your AI. A powerful, lightweight OCR toolkit that bridges the gap between images/PDFs and LLMs. Supports 100+ languages., https://github.com/PADDLEPADDLE/PADDLEOCR
+36. tesseract ocr free download - SourceForge, https://sourceforge.net/directory/?q=tesseract%20ocr
+37. Deterministic OCR in JavaScript: PaddleOCR for Node, Bun, Deno, and the Browser - DEV Community, https://dev.to/awalariansyah/deterministic-ocr-in-javascript-paddleocr-for-node-bun-deno-and-the-browser-2bgn
+38. Problem with OCR when language set to Norwegian · Issue #14345, https://github.com/laurent22/joplin/issues/14345
+39. DeepDoc + VietOCR — Fast and cost-effective OCR tool for Vietnamese - Medium, https://medium.com/@nguyenvohoaivan/deepdoc-vietocr-fast-and-cost-effective-ocr-tool-for-vietnamese-a1c88001f510
+40. Models compatible with the Transformers.js library - Hugging Face, https://huggingface.co/models?library=transformers.js&sort=trending
+41. Automatic speech recognition using Whisper and OpenVINO with Generate API, https://docs.openvino.ai/2024/notebooks/whisper-asr-genai-with-output.html
+42. upstream-transformers/awesome-transformers.md at main · neuralmagic/upstream-transformers - GitHub, https://github.com/neuralmagic/upstream-transformers/blob/main/awesome-transformers.md
+43. (PDF) Edge-optimized threat detection with Florence v2 for autonomous surveillance in resource-constrained environments - ResearchGate, https://www.researchgate.net/publication/402907414_Edge-optimized_threat_detection_with_Florence_v2_for_autonomous_surveillance_in_resource-constrained_environments
+44. PaddleOCR-VL: Boosting Multilingual Document Parsing via a 0.9B Ultra-Compact Vision-Language Model - arXiv, https://arxiv.org/html/2510.14528v2
+45. PaddleOCR vs Tesseract vs IronOCR: Picking an OCR Engine for .NET | by Ahmad Sohail, https://medium.com/@ahmad.sohail/paddleocr-vs-tesseract-vs-ironocr-picking-an-ocr-engine-for-net-10a24dc2802e
+46. LocalAI.Reranker 0.7.2 on NuGet - Libraries.io, https://libraries.io/nuget/LocalAI.Reranker
+47. Transformers.js - Hugging Face, https://huggingface.co/docs/transformers.js/en/index
+48. sillytavern-transformers - UNPKG, https://app.unpkg.com/sillytavern-transformers@2.17.2/files/README.md
+49. Tesseract.js - et javascript-bibliotek som henter ord på nesten alle, https://www.reddit.com/r/javascript/comments/ulrkj5/tesseractjs_a_javascript_library_that_gets_words/?tl=no
+50. Transformers.js - Hugging Face, https://huggingface.co/docs/transformers.js/index
+51. [译] 前端人工智能框架Transformers.js v3 大版本更新！WebGPU、新模型统统有！, https://juejin.cn/post/7428880425534586890
+52. Practical NLP in the Browser with Transformers.js - KDnuggets, https://www.kdnuggets.com/practical-nlp-in-the-browser-with-transformers-js
+53. Output Generation Guided by JSON Schema · Issue #1328 · huggingface/transformers.js, https://github.com/huggingface/transformers.js/issues/1328
+54. transformers-llguidance CDN by jsDelivr - A CDN for npm and GitHub, https://www.jsdelivr.com/package/npm/transformers-llguidance
+55. Guidance - Hugging Face, https://huggingface.co/docs/text-generation-inference/conceptual/guidance
+56. Guidance - Hugging Face, https://huggingface.co/docs/text-generation-inference/en/conceptual/guidance

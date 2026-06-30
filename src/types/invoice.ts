@@ -78,6 +78,10 @@ export interface ExtractionResult {
   invoice: Invoice;
   confidence: ConfidenceMap;
   rawOutput: string;
+  /** Which backend produced this result — populated by the worker */
+  backendId?: string;
+  /** Wall-clock inference time in milliseconds */
+  extractionMs?: number;
 }
 
 /** A single field flagged for human review */

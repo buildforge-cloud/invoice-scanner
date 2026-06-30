@@ -5,15 +5,28 @@ import { rasterizePdf, imageFileToDataUrl } from "./lib/pdfRenderer";
 import { extractPdfText } from "./lib/pdfTextExtractor";
 import { parseInvoiceFromText } from "./lib/textParser";
 import { useInvoiceWorker } from "./hooks/useInvoiceWorker";
+import { DEFAULT_BACKEND_ID } from "./backends/registry";
 import { DropZone } from "./components/DropZone";
 import { ModelLoader } from "./components/ModelLoader";
 import { InvoicePreview } from "./components/InvoicePreview";
 import { ResultPanel } from "./components/ResultPanel";
+import { BackendSelector } from "./components/BackendSelector";
 
 type AppStatus = "idle" | "rendering" | "inferring" | "done" | "error";
 
 export function App() {
-  const { modelStatus, progress, statusMessage, infer } = useInvoiceWorker();
+  const [backendId, setBackendId] = useState<string>(
+    () => localStorage.getItem("backendId") ?? DEFAULT_BACKEND_ID
+  );
+
+  const { modelStatus, progress, statusMessage, infer } = useInvoiceWorker(backendId);
+
+  function handleBackendChange(id: string) {
+    setBackendId(id);
+    localStorage.setItem("backendId", id);
+    setResult(null);
+    setValidation(null);
+  }
 
   const [pageUrls, setPageUrls] = useState<string[]>([]);
   const [currentPage, setCurrentPage] = useState(0);
@@ -48,7 +61,10 @@ export function App() {
 
           if (textResult.hasTextLayer) {
             // Tier 1: deterministic text extraction — instant, no model needed
+            const t0 = Date.now();
             const extracted = parseInvoiceFromText(textResult.lines, textResult.fullText);
+            extracted.backendId = "tier1-text";
+            extracted.extractionMs = Date.now() - t0;
             const v = validateInvoice(extracted.invoice, extracted.confidence);
             setResult(extracted);
             setValidation(v);
@@ -167,8 +183,14 @@ export function App() {
         />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-          {/* Left column: upload + preview */}
+          {/* Left column: backend selector + upload + preview */}
           <div className="space-y-4">
+            <BackendSelector
+              selectedId={backendId}
+              modelStatus={modelStatus}
+              progress={progress}
+              onChange={handleBackendChange}
+            />
             <DropZone
               onFile={handleFile}
               disabled={appStatus === "rendering" || isScanning}

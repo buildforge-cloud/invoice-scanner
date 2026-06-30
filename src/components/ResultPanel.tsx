@@ -1,7 +1,7 @@
-import { useState } from "react";
 import type { ExtractionResult, ValidationResult, Invoice } from "../types/invoice";
 import { ValidationBadge } from "./ValidationBadge";
 import { FieldEditor } from "./FieldEditor";
+import { DebugPanel } from "./DebugPanel";
 
 interface Props {
   result: ExtractionResult;
@@ -11,7 +11,6 @@ interface Props {
 }
 
 export function ResultPanel({ result, validation, onCorrect, onExport }: Props) {
-  const [showRaw, setShowRaw] = useState(false);
 
   return (
     <div className="space-y-4">
@@ -96,21 +95,7 @@ export function ResultPanel({ result, validation, onCorrect, onExport }: Props) 
         </div>
       </div>
 
-      {/* Raw model output — useful for debugging extraction failures */}
-      <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-        <button
-          onClick={() => setShowRaw((v) => !v)}
-          className="w-full flex items-center justify-between px-4 py-3 text-left text-xs font-medium text-slate-500 hover:bg-slate-50"
-        >
-          <span>Raw model output</span>
-          <span>{showRaw ? "▲ hide" : "▼ show"}</span>
-        </button>
-        {showRaw && (
-          <pre className="px-4 pb-4 text-xs text-slate-600 whitespace-pre-wrap break-all font-mono max-h-64 overflow-auto border-t border-slate-100">
-            {result.rawOutput || "(empty — model produced no output)"}
-          </pre>
-        )}
-      </div>
+      <DebugPanel result={result} />
     </div>
   );
 }
