@@ -6,57 +6,66 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 npm install          # first-time setup
-npm run dev          # dev server at http://localhost:5173
+npm run dev          # dev server — see proxy note below
 npm run build        # tsc type-check + vite production build
 npm run preview      # serve the production build locally
 ```
 
-No test runner is configured yet (PoC stage).
+No test runner is configured (PoC stage).
+
+**Dev proxy:** The dev server is accessed via `dev.buildforge.cloud/proxy/5173`. `vite.config.ts` sets `base: "/proxy/5173/"` and includes a middleware that rewrites incoming URLs to include the prefix. HMR is disabled (WebSocket can't route through path-based proxies) — reload manually after changes.
 
 ## Architecture
 
-This is a **fully serverless, in-browser invoice scanner** — no API calls, no backend. Every byte of processing happens on the user's device using WebAssembly/WebGPU.
+Fully serverless, in-browser invoice scanner. No API calls, no backend. All processing runs on the user's device.
 
-### Data flow
+### Two-tier extraction pipeline
 
 ```
-File upload (PDF/image)
-  → pdfRenderer.ts   — PDF.js rasterizes each page to a canvas data URL
-  → inference.worker.ts — Transformers.js runs a VLM (SmolVLM or Donut) entirely
-                          in a Web Worker via WebGPU (fallback: WASM)
-  → App.tsx          — receives ExtractionResult { invoice, confidence, rawOutput }
-  → validator.ts     — deterministic checks wrap the probabilistic AI output
-  → ResultPanel      — shows extracted data; FieldEditor surfaces low-confidence fields
-                       for human correction (HITL)
+File upload (PDF / image)
+  │
+  ├─ PDF with text layer?
+  │    └─ Tier 1 (instant): pdfTextExtractor.ts → textParser.ts → ExtractionResult
+  │
+  └─ Scanned PDF / image / no text layer?
+       └─ Tier 2 (AI): pdfRenderer.ts (rasterise) → inference.worker.ts → ExtractionResult
+            └─ SmolVLM-500M-Instruct via Transformers.js (WebGPU / WASM fallback)
+
+ExtractionResult → validator.ts → ValidationResult
+                                       └─ flaggedFields → FieldEditor (HITL review)
 ```
 
-### Key architectural constraints
+**Tier 1** (`src/lib/textParser.ts`) — regex extraction for structured PDFs. Handles Norwegian number format (`23.002,32` = dot thousands, comma decimal). Extraction order matters: buyer is extracted before seller so the seller scan can skip the buyer's name. Math consistency check is skipped when any `lineExtensionAmount < 0` (credit card statements include payment credits in line items).
 
-**COOP/COEP headers are required.** `vite.config.ts` sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on the dev server. Without these, `SharedArrayBuffer` is unavailable and the ONNX Runtime WASM backend fails. The production host must also send these headers.
+**Tier 2** (`src/workers/inference.worker.ts`) — Transformers.js loads `HuggingFaceTB/SmolVLM-500M-Instruct`. Device detection tries WebGPU (`fp16`) and falls back to WASM (`q8`). Model weights (~300 MB) are downloaded once and cached in IndexedDB by Transformers.js. Progress is tracked byte-by-byte across processor (0–10%) and model weights (10–100%) so the bar never jumps backward.
 
-**Model weights are cached in IndexedDB.** On first load, Transformers.js downloads quantized ONNX weights (~100–300 MB) from the Hugging Face CDN. Subsequent visits are fully offline. The `useModel` hook tracks download progress via the library's `progress_callback`.
+**The Tier 1 path is an optimisation for text-layer PDFs, not the general solution.** Tier 2 (VLM) is the general path and handles any invoice type.
 
-**Inference runs in a Web Worker.** The VLM blocks for several seconds; keeping it off the main thread prevents UI freezes. The worker file is `src/workers/inference.worker.ts` and is bundled as an ES module worker (`vite.config.ts → worker.format: "es"`).
+### Key constraints
 
-**pdfjs-dist worker is loaded from CDN.** `pdfRenderer.ts` lazy-imports pdfjs and points `GlobalWorkerOptions.workerSrc` at unpkg to avoid bundling the ~300 KB worker script.
+**COOP/COEP headers are mandatory.** `SharedArrayBuffer` (required by ONNX Runtime WASM) is only available when the page is cross-origin isolated. `vite.config.ts` sets these on the dev server; the production host must do the same.
 
-### Schema and validation
+**Workers must be ES module format.** `vite.config.ts` sets `worker.format: "es"`. The worker is instantiated with `{ type: "module" }` in `useInvoiceWorker.ts`.
 
-`src/types/invoice.ts` defines the `Invoice` interface, which is a simplified subset of **Peppol BIS Billing 3.0** (European standard EN 16931). All AI output must map to this type.
+**`pdfjs-dist` and `@huggingface/transformers` are excluded from Vite's dep optimiser** (`optimizeDeps.exclude`) — both ship their own worker/WASM bundles that conflict with Vite's pre-bundling.
 
-`src/lib/validator.ts` runs four deterministic checks against every extracted `Invoice`:
-1. **Required field presence** — list defined in `src/lib/schema.ts → REQUIRED_FIELDS`
-2. **Format validation** — ISO 4217 currency, ISO 8601 dates, ISO 3166-1 alpha-2 country codes, UNTDID 1001 type codes
-3. **Math consistency** — `sum(lineItems.lineExtensionAmount) + sum(taxSubtotals.taxAmount)` must equal `totals.payableAmount` within ±0.02
-4. **Confidence gating** — any field with a model confidence score below `CONFIDENCE_THRESHOLD` (0.85) is added to `ValidationResult.flaggedFields` and surfaced in `FieldEditor` for human correction
+**PDF.js worker is loaded from CDN** (`unpkg`) to avoid bundling the ~300 KB worker script.
 
-`ValidationResult.valid` is `true` only when there are zero issues of kinds `math_mismatch`, `missing_required`, or `invalid_format` — `low_confidence` warnings do not block the valid flag.
+### Schema and validation (`src/lib/schema.ts`, `src/lib/validator.ts`)
 
-### What is still pending (PoC scaffold)
+`src/types/invoice.ts` defines the `Invoice` interface as a simplified subset of **Peppol BIS Billing 3.0** (EN 16931). All extraction output maps to this type.
 
-The following files are not yet implemented:
-- `src/components/ResultPanel.tsx` — invoice data display + export button
-- `src/hooks/useModel.ts` — model load state machine + progress tracking
-- `src/hooks/useInference.ts` — sends image to worker, streams tokens back
-- `src/workers/inference.worker.ts` — Transformers.js pipeline inside Web Worker
-- `src/App.tsx` and `src/main.tsx` — top-level layout and React root
+`REQUIRED_FIELDS`: `invoiceNumber`, `issueDate`, `typeCode`, `currencyCode`, `buyer`, `seller`, `totals` — missing any of these blocks `ValidationResult.valid`.
+
+`RECOMMENDED_FIELDS`: `lineItems` — missing is a `low_confidence` warning, not a hard error (credit card statements and receipts legitimately omit line items).
+
+`CONFIDENCE_THRESHOLD = 0.85` — fields below this are added to `ValidationResult.flaggedFields` and surfaced in `FieldEditor` for human correction. `valid` is only blocked by `math_mismatch`, `missing_required`, and `invalid_format` issues; `low_confidence` warnings do not block it.
+
+### HITL flow (`src/components/FieldEditor.tsx`)
+
+`FieldEditor` receives `flaggedFields` from `ValidationResult`. Each field has a controlled input and an explicit **Confirm** button (Enter also confirms). Confirming calls `handleCorrect` in `App.tsx`, which:
+1. Writes the corrected value into the invoice via `applyNestedUpdate` (dot-notation path)
+2. Deletes the confidence entry for that field
+3. Re-runs `validateInvoice`
+
+Confirmed fields stay visible in the panel (green state) so the user can see what was saved — they are not removed from the rendered list even though they drop out of `flaggedFields`.
